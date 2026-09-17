@@ -70,8 +70,8 @@ use tempo_contracts::precompiles::{ZONE_FACTORY_ADDRESS, initial_zone_factory_co
 use tempo_evm::{TempoEvmConfig, consensus::TempoConsensus};
 use tempo_faucet::faucet::{TempoFaucetExt, TempoFaucetExtApiServer};
 pub use tempo_node::{
-    AccountInfoReader, InvalidPoolTransactionError, PoolTransaction, PoolTransactionError,
-    StatefulValidationFn, StatelessValidationFn, TempoNode, TempoNodeArgs,
+    AccountInfoReader, AddressFilter, InvalidPoolTransactionError, PoolTransaction,
+    PoolTransactionError, StatefulValidationFn, StatelessValidationFn, TempoNode, TempoNodeArgs,
     TempoPayloadBuilderBuilder, TempoPoolBuilder, TempoPoolTransactionError,
     TempoPooledTransaction, TransactionOrigin,
 };
@@ -356,10 +356,18 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
             )
         });
 
+        #[expect(
+            deprecated,
+            reason = "Maintain backward compatibility until all nodes have been updated; \
+                      V1 blob creation will be enabled in a followup."
+        )]
         let runtime_config = commonware_runtime::tokio::Config::default()
             .with_tcp_nodelay(Some(true))
             .with_worker_threads(args.consensus.worker_threads)
             .with_storage_directory(consensus_storage)
+            .with_storage_blob_layouts(
+                commonware_runtime::BlobLayout::V0..=commonware_runtime::BlobLayout::V0,
+            )
             .with_catch_panics(true);
 
         let runner = commonware_runtime::tokio::Runner::new(runtime_config);
@@ -453,6 +461,21 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
         |spec: Arc<TempoChainSpec>| (TempoEvmConfig::new(spec.clone()), TempoConsensus::new(spec));
 
     cli.run_with_components::<TempoNode>(components, async move |builder, args| {
+        if let Some(value) = args.consensus.message_backlog {
+            warn!(
+                flag = "--consensus.message-backlog",
+                value,
+                "deprecated flag ignored; P2P queue capacities are derived from peer-set limits and channel quotas"
+            );
+        }
+        if let Some(value) = args.consensus.inactive_views_until_leader_skip {
+            warn!(
+                flag = "--consensus.inactive-views-until-leader-skip",
+                value,
+                "deprecated flag ignored; leader skipping is driven by --consensus.inactive-time-before-leader-skip"
+            );
+        }
+
         // Register before launch because each RLPx session negotiates its
         // subprotocols during the handshake. The startup channel passes the
         // consensus half of the transport to the consensus thread.
@@ -644,7 +667,7 @@ pub fn tempo_main_with(mut overrides: TempoOverrides) -> eyre::Result<()> {
 
     match consensus_handle.join() {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => eprintln!("consensus task exited with error:\n{err:?}"),
+        Ok(Err(err)) => return Err(err).wrap_err("consensus task exited with error"),
         Err(unwind) => std::panic::resume_unwind(unwind),
     }
     Ok(())
@@ -675,6 +698,80 @@ mod tests {
     fn init_defaults_once() {
         static INIT: Once = Once::new();
         INIT.call_once(defaults::init_defaults);
+    }
+
+    #[test]
+    fn txpool_filter_defaults_empty_and_parses_address_list_or_file() {
+        let cli = TempoCli::try_parse_from(["tempo", "node", "--dev"]).unwrap();
+        let Commands::Node(node_cmd) = cli.command else {
+            panic!("expected node command");
+        };
+        assert!(node_cmd.ext.node_args.txpool_filter.is_none());
+
+        let cli = TempoCli::try_parse_from([
+            "tempo",
+            "node",
+            "--dev",
+            "--txpool.filter",
+            "0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002",
+        ])
+        .unwrap();
+        let Commands::Node(node_cmd) = cli.command else {
+            panic!("expected node command");
+        };
+        let filter = node_cmd.ext.node_args.txpool_filter.as_ref().unwrap();
+        assert_eq!(filter.len(), 2);
+        assert!(filter.contains(&address!("0000000000000000000000000000000000000001")));
+        assert!(filter.contains(&address!("0000000000000000000000000000000000000002")));
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "0x0000000000000000000000000000000000000003\n\n\
+             0x0000000000000000000000000000000000000004, \
+             0x0000000000000000000000000000000000000005,\
+             0x0000000000000000000000000000000000000003\n",
+        )
+        .unwrap();
+        let cli = TempoCli::try_parse_from([
+            "tempo",
+            "node",
+            "--dev",
+            "--txpool.filter",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        let Commands::Node(node_cmd) = cli.command else {
+            panic!("expected node command");
+        };
+        let filter = node_cmd.ext.node_args.txpool_filter.as_ref().unwrap();
+        assert_eq!(filter.len(), 3);
+        assert!(filter.contains(&address!("0000000000000000000000000000000000000003")));
+        assert!(filter.contains(&address!("0000000000000000000000000000000000000004")));
+        assert!(filter.contains(&address!("0000000000000000000000000000000000000005")));
+    }
+
+    #[test]
+    fn txpool_filter_reports_invalid_file_entry() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "0x0000000000000000000000000000000000000001\nnot-an-address\n",
+        )
+        .unwrap();
+
+        let error = TempoCli::try_parse_from([
+            "tempo",
+            "node",
+            "--dev",
+            "--txpool.filter",
+            file.path().to_str().unwrap(),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(file.path().to_str().unwrap()));
+        assert!(error.contains("invalid address `not-an-address` on line 2"));
     }
 
     fn parse_follow(args: &[&str]) -> Option<FollowMode> {
